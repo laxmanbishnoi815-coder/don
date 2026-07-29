@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""
+card_sorter.py  —  Card File Maker & BIN Sorter Bot
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Runs as an aiohttp web-server so Replit's health probe is satisfied.
+• In production (WEBHOOK_URL set): Telegram pushes updates to /webhook/<TOKEN>
+• In development (no WEBHOOK_URL):  falls back to long-polling automatically
+
+Features:
+  • Send any text / file with cards  → card numbers only → .txt file
+  • /bin  <number>   → BIN info + card count + "Separate" button
+  • /bank <name>     → bank search + card count + "Separate" button
+  • /stats           → totals, top BINs, top banks
+  • /separate bin  <bin>   → .txt file for that BIN
+  • /separate bank <name>  → .txt file for that bank
+  • /clear           → owner-only: wipe the database
+  • /help            → command list
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+
+import aiohttp
+from aiohttp import web
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ──────────────────────────────────────────────────────────
+# CONFIG  — edit these before deploying
+# ──────────────────────────────────────────────────────────
+BOT_TOKEN   = os.environ.get("BOT_TOKEN",   "8936693353:AAFYoCj5FwF76Aiz4ydyJ0BIs_J83QQ2tBQ")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")          # e.g. https://yourapp.replit.app
+OWNER_ID    = int(os.environ.get("OWNER_ID", "0")) or None  # set to your Telegram user ID
+PORT        = int(os.environ.get("PORT", "5000"))
+DB_FILE         = os.environ.get("DB_FILE",  "cards_db.json")
+BIN_CACHE_FILE  = os.environ.get("BIN_CACHE_FILE", "bin_cache.json")
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────
+# DATABASE
+# ──────────────────────────────────────────────────────────
+def _load_db() -> dict:
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"cards": {}}
+
+
+def _save_db(db: dict) -> None:
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+_BIN_CACHE: dict = {}
+
+
+def _load_bin_cache() -> dict:
+    if os.path.exists(BIN_CACHE_FILE):
+        try:
+            with open(BIN_CACHE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_bin_cache() -> None:
+    with open(BIN_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(_BIN_CACHE, f, ensure_ascii=False, indent=2)
+
+
+# ──────────────────────────────────────────────────────────
+# CARD EXTRACTION
+# ──────────────────────────────────────────────────────────
+_CARD_RE = re.compile(
+    r"(?<!\d)"
+    r"(\d{13,19})"
+    r"(?:[\s|/,;:-]+\d{1,2}[\s|/,;:-]+\d{2,4}(?:[\s|/,;:-]+\d{3,4})?)?"
+    r"(?!\d)"
+)
+
+
+def luhn_check(number: str) -> bool:
+    try:
+        digits = [int(d) for d in number]
+    except ValueError:
+        return False
+    digits.reverse()
+    total = 0
+    for i, d in enumerate(digits):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def extract_card_numbers(text: str) -> list:
+    seen, seen_set = [], set()
+    for m in _CARD_RE.finditer(text):
+        num = m.group(1)
+        if num not in seen_set and luhn_check(num):
+            seen_set.add(num)
+            seen.append(num)
+    return seen
+
+
+# ──────────────────────────────────────────────────────────
+# BIN LOOKUP
+# ──────────────────────────────────────────────────────────
+async def lookup_bin(bin6: str, session: aiohttp.ClientSession) -> dict:
+    global _BIN_CACHE
+    if bin6 in _BIN_CACHE:
+        return _BIN_CACHE[bin6]
+    info = {"bank": "Unknown", "scheme": "Unknown",
+            "country": "Unknown", "type": "Unknown"}
+    try:
+        url = f"https://lookup.binlist.net/{bin6}"
+        headers = {"Accept-Version": "3", "User-Agent": "CardSorterBot/1.0"}
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=6)) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                info["bank"]    = (data.get("bank") or {}).get("name") or "Unknown"
+                info["scheme"]  = (data.get("scheme") or "Unknown").upper()
+                info["country"] = (data.get("country") or {}).get("name") or "Unknown"
+                info["type"]    = (data.get("type") or "Unknown").upper()
+    except Exception as e:
+        log.debug("BIN lookup %s: %s", bin6, e)
+    _BIN_CACHE[bin6] = info
+    _save_bin_cache()
+    return info
+
+
+# ──────────────────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────────────────
+def _esc(t: str) -> str:
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _make_file_bytes(cards: list) -> bytes:
+    return "\n".join(cards).encode("utf-8")
+
+
+def _cards_by_bin(db: dict, bin6: str) -> list:
+    return [n for n, v in db["cards"].items() if v["bin"] == bin6]
+
+
+def _cards_by_bank(db: dict, bank_name: str) -> list:
+    bn = bank_name.lower()
+    return [n for n, v in db["cards"].items() if bn in v["bank"].lower()]
+
+
+def _is_owner(uid: int) -> bool:
+    return OWNER_ID is None or uid == OWNER_ID
+
+
+def _bin_stats(db: dict) -> Counter:
+    return Counter(v["bin"] for v in db["cards"].values())
+
+
+def _bank_stats(db: dict) -> Counter:
+    return Counter(v["bank"] for v in db["cards"].values())
+
+
+# ──────────────────────────────────────────────────────────
+# /start  /help
+# ──────────────────────────────────────────────────────────
+HELP_TEXT = (
+    "🦇 <b>Card Sorter Bot</b>\n"
+    "━━━━━━━━━━━━━━━━━━━\n\n"
+    "Send me a <b>text with cards</b> and I will:\n"
+    "  • Extract card numbers only\n"
+    "  • Look up BIN + Bank info\n"
+    "  • Save them to the database\n"
+    "  • Send you a clean <code>.txt</code> file\n\n"
+    "You can also <b>upload a .txt / .csv file</b> directly.\n\n"
+    "<b>Commands:</b>\n"
+    "  /bin <code>&lt;6-digit BIN&gt;</code>   – count + info\n"
+    "  /bank <code>&lt;bank name&gt;</code>    – count + info\n"
+    "  /separate <code>bin &lt;BIN&gt;</code>  – file for that BIN\n"
+    "  /separate <code>bank &lt;name&gt;</code>– file for that bank\n"
+    "  /stats                   – full database stats\n"
+    "  /clear                   – wipe database (owner)\n"
+)
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+# ──────────────────────────────────────────────────────────
+# CARD TEXT / FILE HANDLER
+# ──────────────────────────────────────────────────────────
+async def _process_cards_text(update, text: str) -> None:
+    cards = extract_card_numbers(text)
+    if not cards:
+        await update.message.reply_text(
+            "❌ No valid card numbers found.\n"
+            "Format: <code>4111111111111111|12|26|123</code> or plain card number.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    progress = await update.message.reply_text(
+        f"🔍 Found <b>{len(cards)}</b> card(s). Looking up BINs…",
+        parse_mode=ParseMode.HTML,
+    )
+
+    db = _load_db()
+    new_count = dup_count = 0
+    bin_info_map: dict = {}
+
+    async with aiohttp.ClientSession() as session:
+        sem = asyncio.Semaphore(3)
+
+        async def _throttled(b6):
+            async with sem:
+                await asyncio.sleep(0.35)
+                return b6, await lookup_bin(b6, session)
+
+        for b6, info in await asyncio.gather(
+            *[_throttled(c[:6]) for c in {c[:6] for c in cards}]
+        ):
+            bin_info_map[b6] = info
+
+    for num in cards:
+        if num in db["cards"]:
+            dup_count += 1
+        else:
+            b6   = num[:6]
+            info = bin_info_map.get(b6, {})
+            db["cards"][num] = {
+                "bin":     b6,
+                "bank":    info.get("bank",    "Unknown"),
+                "scheme":  info.get("scheme",  "Unknown"),
+                "country": info.get("country", "Unknown"),
+                "type":    info.get("type",    "Unknown"),
+                "added":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            new_count += 1
+
+    _save_db(db)
+
+    # BIN breakdown (capped at 20 lines)
+    bin_counts: dict = defaultdict(int)
+    for num in cards:
+        bin_counts[num[:6]] += 1
+
+    lines = []
+    for b6, cnt in sorted(bin_counts.items(), key=lambda x: -x[1])[:20]:
+        info = bin_info_map.get(b6, {})
+        lines.append(
+            f"  <code>{b6}</code> ×{cnt}  "
+            f"{_esc(info.get('scheme','?'))} — {_esc(info.get('bank','?'))} — {_esc(info.get('country','?'))}"
+        )
+    if len(bin_counts) > 20:
+        lines.append(f"  … and {len(bin_counts)-20} more BINs")
+
+    caption = (
+        f"✅ <b>Done!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Found   : <b>{len(cards)}</b>\n"
+        f"🆕 New     : <b>{new_count}</b>\n"
+        f"♻️  Dupes   : <b>{dup_count}</b>\n"
+        f"💾 DB total: <b>{len(db['cards'])}</b>\n\n"
+        f"<b>BIN breakdown:</b>\n" + "\n".join(lines)
+    )
+
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn  = f"cards_{ts}_{len(cards)}.txt"
+    try:
+        await progress.delete()
+    except Exception:
+        pass
+    await update.message.reply_document(
+        document=InputFile(_make_file_bytes(cards), fn),
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def handle_cards_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _process_cards_text(update, update.message.text or "")
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    doc = update.message.document
+    if not doc:
+        return
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large (max 5 MB).")
+        return
+    progress = await update.message.reply_text("📥 Reading file…")
+    try:
+        file      = await doc.get_file()
+        raw_bytes = await file.download_as_bytearray()
+        text      = raw_bytes.decode("utf-8", errors="ignore")
+    except Exception as e:
+        await progress.edit_text(f"❌ Could not read file: {e}")
+        return
+    await progress.delete()
+    await _process_cards_text(update, text)
+
+
+# ──────────────────────────────────────────────────────────
+# /bin
+# ──────────────────────────────────────────────────────────
+async def cmd_bin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text(
+            "ℹ️ Usage: /bin <code>411111</code>", parse_mode=ParseMode.HTML)
+        return
+    bin6 = ctx.args[0].strip()[:6]
+    if not bin6.isdigit() or len(bin6) < 4:
+        await update.message.reply_text("❌ BIN must be 4–6 digits.")
+        return
+
+    db    = _load_db()
+    cards = _cards_by_bin(db, bin6)
+
+    async with aiohttp.ClientSession() as session:
+        info = await lookup_bin(bin6, session)
+
+    text = (
+        f"🔎 <b>BIN: <code>{bin6}</code></b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🏦 Bank    : <b>{_esc(info.get('bank','Unknown'))}</b>\n"
+        f"💳 Scheme  : <b>{_esc(info.get('scheme','Unknown'))}</b>\n"
+        f"🌍 Country : <b>{_esc(info.get('country','Unknown'))}</b>\n"
+        f"📋 Type    : <b>{_esc(info.get('type','Unknown'))}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📂 Cards in DB : <b>{len(cards)}</b>"
+    )
+    kb = None
+    if cards:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"📁 Separate to File ({len(cards)} cards)",
+                callback_data=f"sep:bin:{bin6}",
+            )
+        ]])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ──────────────────────────────────────────────────────────
+# /bank
+# ──────────────────────────────────────────────────────────
+async def cmd_bank(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text(
+            "ℹ️ Usage: /bank <code>Chase</code>", parse_mode=ParseMode.HTML)
+        return
+    bank_name = " ".join(ctx.args).strip()
+    db        = _load_db()
+    cards     = _cards_by_bank(db, bank_name)
+    all_banks = _bank_stats(db)
+    matched   = {b: c for b, c in all_banks.items()
+                 if bank_name.lower() in b.lower()}
+
+    if not matched:
+        await update.message.reply_text(
+            f"❌ No cards for bank matching <b>{_esc(bank_name)}</b>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    match_lines = "\n".join(
+        f"  • <b>{_esc(b)}</b> — {c} cards"
+        for b, c in sorted(matched.items(), key=lambda x: -x[1])[:15]
+    )
+    text = (
+        f"🏦 <b>Bank:</b> <code>{_esc(bank_name)}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📂 Total matching: <b>{len(cards)}</b>\n\n"
+        f"<b>Matched banks:</b>\n{match_lines}"
+    )
+    kb = None
+    if cards:
+        safe = re.sub(r"[^\w]", "_", bank_name)[:40]
+        kb   = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"📁 Separate to File ({len(cards)} cards)",
+                callback_data=f"sep:bank:{safe}",
+            )
+        ]])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ──────────────────────────────────────────────────────────
+# /stats
+# ──────────────────────────────────────────────────────────
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db    = _load_db()
+    total = len(db["cards"])
+    if total == 0:
+        await update.message.reply_text("📊 Database is empty. Send some cards first!")
+        return
+
+    bin_c  = _bin_stats(db)
+    bank_c = _bank_stats(db)
+
+    async with aiohttp.ClientSession() as session:
+        bin_lines = []
+        for b6, cnt in bin_c.most_common(10):
+            info = await lookup_bin(b6, session)
+            bin_lines.append(
+                f"  <code>{b6}</code> ×<b>{cnt}</b>  "
+                f"{_esc(info.get('scheme','?'))} — {_esc(info.get('bank','?'))}"
+            )
+
+    bank_lines = [
+        f"  <b>{_esc(b)}</b> × {c}"
+        for b, c in bank_c.most_common(10)
+    ]
+    text = (
+        f"📊 <b>Database Stats</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 Total cards : <b>{total}</b>\n"
+        f"🔢 Unique BINs : <b>{len(bin_c)}</b>\n"
+        f"🏦 Unique banks: <b>{len(bank_c)}</b>\n\n"
+        f"<b>🔝 Top BINs:</b>\n" + "\n".join(bin_lines) +
+        "\n\n<b>🔝 Top Banks:</b>\n" + "\n".join(bank_lines)
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ──────────────────────────────────────────────────────────
+# /separate
+# ──────────────────────────────────────────────────────────
+async def cmd_separate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "ℹ️ Usage:\n"
+            "  /separate <code>bin 411111</code>\n"
+            "  /separate <code>bank Chase</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await _send_separate_file(update.message, ctx.args[0].lower(), " ".join(ctx.args[1:]).strip())
+
+
+async def _send_separate_file(message, kind: str, value: str) -> None:
+    db = _load_db()
+    if kind == "bin":
+        cards   = _cards_by_bin(db, value[:6])
+        label   = f"BIN_{value[:6]}"
+        heading = f"BIN <code>{_esc(value[:6])}</code>"
+    elif kind == "bank":
+        cards   = _cards_by_bank(db, value)
+        label   = re.sub(r"[^\w]", "_", value)[:30]
+        heading = f"Bank <b>{_esc(value)}</b>"
+    else:
+        await message.reply_text("❌ Use <code>bin</code> or <code>bank</code>.",
+                                 parse_mode=ParseMode.HTML)
+        return
+
+    if not cards:
+        await message.reply_text(
+            f"❌ No cards found for {heading}.", parse_mode=ParseMode.HTML)
+        return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = f"{label}_{len(cards)}cards_{ts}.txt"
+    await message.reply_document(
+        document=InputFile(_make_file_bytes(cards), fn),
+        caption=(
+            f"📁 <b>Separated File</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Filter : {heading}\n"
+            f"Cards  : <b>{len(cards)}</b>\n"
+            f"File   : <code>{_esc(fn)}</code>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ──────────────────────────────────────────────────────────
+# INLINE CALLBACK
+# ──────────────────────────────────────────────────────────
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "sep":
+        return
+    _, kind, value = parts
+    if kind == "bank":
+        value = value.replace("_", " ")
+    await q.message.reply_text(
+        f"⏳ Generating file for {kind} <code>{_esc(value)}</code>…",
+        parse_mode=ParseMode.HTML,
+    )
+    await _send_separate_file(q.message, kind, value)
+
+
+# ──────────────────────────────────────────────────────────
+# /clear
+# ──────────────────────────────────────────────────────────
+async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ Owner only.")
+        return
+    _save_db({"cards": {}})
+    await update.message.reply_text("🗑️ Database cleared.")
+
+
+# ──────────────────────────────────────────────────────────
+# BUILD PTB APPLICATION
+# ──────────────────────────────────────────────────────────
+def _build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).updater(None).build()
+
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("bin",      cmd_bin))
+    app.add_handler(CommandHandler("bank",     cmd_bank))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("separate", cmd_separate))
+    app.add_handler(CommandHandler("clear",    cmd_clear))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cards_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    return app
+
+
+# ──────────────────────────────────────────────────────────
+# WEBHOOK SERVER  (production mode)
+# ──────────────────────────────────────────────────────────
+async def _run_webhook(ptb_app: Application) -> None:
+    """Start aiohttp server, register Telegram webhook, serve updates."""
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    webhook_full = WEBHOOK_URL.rstrip("/") + webhook_path
+
+    await ptb_app.initialize()
+    await ptb_app.start()
+    await ptb_app.bot.set_webhook(
+        url=webhook_full,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+    log.info("Webhook registered: %s", webhook_full)
+
+    aio_app = web.Application()
+
+    async def health(_req: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
+
+    async def webhook_handler(req: web.Request) -> web.Response:
+        try:
+            data   = await req.json()
+            update = Update.de_json(data, ptb_app.bot)
+            await ptb_app.process_update(update)
+        except Exception as e:
+            log.error("Webhook handler error: %s", e)
+        return web.Response(status=200)
+
+    aio_app.router.add_get("/",             health)
+    aio_app.router.add_get("/healthz",      health)
+    aio_app.router.add_post(webhook_path,   webhook_handler)
+
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Listening on 0.0.0.0:%d (webhook mode)", PORT)
+
+    try:
+        await asyncio.Event().wait()       # run forever
+    finally:
+        await ptb_app.bot.delete_webhook()
+        await ptb_app.stop()
+        await ptb_app.shutdown()
+        await runner.cleanup()
+
+
+# ──────────────────────────────────────────────────────────
+# POLLING SERVER  (development mode — no WEBHOOK_URL)
+# ──────────────────────────────────────────────────────────
+async def _run_polling_with_health(ptb_app: Application) -> None:
+    """Run long-polling + a tiny health server on PORT so Replit preview works."""
+    aio_app = web.Application()
+
+    async def health(_req: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "mode": "polling"})
+
+    aio_app.router.add_get("/",        health)
+    aio_app.router.add_get("/healthz", health)
+
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Health server on 0.0.0.0:%d (polling mode)", PORT)
+
+    await ptb_app.initialize()
+    await ptb_app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+    await ptb_app.start()
+    log.info("Bot polling started")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await ptb_app.updater.stop()
+        await ptb_app.stop()
+        await ptb_app.shutdown()
+        await runner.cleanup()
+
+
+# ──────────────────────────────────────────────────────────
+# ENTRY POINT
+# ──────────────────────────────────────────────────────────
+def main() -> None:
+    global _BIN_CACHE
+    _BIN_CACHE = _load_bin_cache()
+    log.info("BIN cache: %d entries", len(_BIN_CACHE))
+
+    # Application.builder().updater(None) disables the built-in updater so we
+    # control the event loop ourselves — needed for both webhook and our custom
+    # polling wrapper.
+    ptb_app = _build_app()
+
+    if WEBHOOK_URL:
+        log.info("Starting in WEBHOOK mode → %s", WEBHOOK_URL)
+        asyncio.run(_run_webhook(ptb_app))
+    else:
+        log.info("WEBHOOK_URL not set — starting in POLLING mode")
+        # Recreate with default updater for polling
+        ptb_app2 = Application.builder().token(BOT_TOKEN).build()
+        # re-register handlers
+        ptb_app2.add_handler(CommandHandler("start",    cmd_start))
+        ptb_app2.add_handler(CommandHandler("help",     cmd_help))
+        ptb_app2.add_handler(CommandHandler("bin",      cmd_bin))
+        ptb_app2.add_handler(CommandHandler("bank",     cmd_bank))
+        ptb_app2.add_handler(CommandHandler("stats",    cmd_stats))
+        ptb_app2.add_handler(CommandHandler("separate", cmd_separate))
+        ptb_app2.add_handler(CommandHandler("clear",    cmd_clear))
+        ptb_app2.add_handler(CallbackQueryHandler(handle_callback))
+        ptb_app2.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cards_text))
+        ptb_app2.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+        asyncio.run(_run_polling_with_health(ptb_app2))
+
+
+if __name__ == "__main__":
+    main()
